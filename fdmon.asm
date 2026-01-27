@@ -23,8 +23,10 @@ section .data
     a_clear:     db 27,"[2J",27,"[H",0
     a_home:      db 27,"[H",0
     a_hide:      db 27,"[?25l",0
-    a_show:      db 27,"[?25h",0
     a_clreos:    db 27,"[J",0
+    a_alt_on:    db 27,"[?1049h",0
+    a_cleanup:   db 27,"[?25h",27,"[?1049l"
+    CLEANUP_LEN  equ $ - a_cleanup
     a_bold:      db 27,"[1m",0
     a_bold_cyan: db 27,"[1;36m",0
     a_cyan:      db 27,"[36m",0
@@ -59,6 +61,8 @@ section .bss
     nbuf:   resb 32
     procs:  resb PROC_SZ * MAX_PROCS
     pcnt:   resq 1
+    winsz:  resb 8
+    maxdsp: resd 1
 
 section .text
     global _start
@@ -67,8 +71,8 @@ section .text
 on_sigint:
     mov eax, 1
     mov edi, 1
-    mov rsi, a_show
-    mov edx, 6
+    mov rsi, a_cleanup
+    mov edx, CLEANUP_LEN
     syscall
     mov eax, 60
     xor edi, edi
@@ -90,6 +94,8 @@ _start:
     mov rax, obuf
     mov [optr], rax
 
+    mov rsi, a_alt_on
+    call emit
     mov rsi, a_hide
     call emit
     mov rsi, a_clear
@@ -99,6 +105,23 @@ _start:
 .loop:
     mov rax, obuf
     mov [optr], rax
+
+    ; Query terminal height
+    mov eax, 16
+    mov edi, 1
+    mov esi, 0x5413
+    lea rdx, [winsz]
+    syscall
+    movzx eax, word [winsz]
+    sub eax, 12
+    jg .got_rows
+    mov eax, 1
+.got_rows:
+    cmp eax, MAX_SHOW
+    jle .rows_ok
+    mov eax, MAX_SHOW
+.rows_ok:
+    mov [maxdsp], eax
 
     mov rsi, a_home
     call emit
@@ -479,9 +502,10 @@ show_procs:
     call emit
 
     mov r12, [pcnt]
-    cmp r12, MAX_SHOW
+    mov eax, [maxdsp]
+    cmp r12, rax
     jle .cntok
-    mov r12d, MAX_SHOW
+    mov r12d, eax
 .cntok:
     xor r13d, r13d
     xor ebx, ebx
