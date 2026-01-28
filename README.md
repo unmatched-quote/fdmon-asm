@@ -29,6 +29,15 @@ make
 ./fdmon
 ```
 
+## Keys
+
+| Key | Action |
+|-----|--------|
+| `F` | Sort by FD count (default) |
+| `P` | Sort by PID |
+| `M` | Toggle memory column (RSS) |
+| `Q` | Quit |
+
 ## System limits
 
 The bottom of the display shows three values read from procfs:
