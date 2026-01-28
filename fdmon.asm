@@ -1,18 +1,33 @@
 ; fdmon - x86_64 Linux file descriptor monitor
-; Displays open fd counts per process, sorted descending
 ; Build: nasm -f elf64 fdmon.asm && ld -o fdmon fdmon.o
 
 BITS 64
 
 %define MAX_PROCS   512
 %define MAX_SHOW    32
-%define PROC_SZ     32
+%define PROC_SZ     40
 %define OFF_PID     0
 %define OFF_FDS     8
-%define OFF_NAME    16
+%define OFF_MEM     16
+%define OFF_NAME    24
 %define NAME_LEN    16
 %define DBUF_SZ     8192
 %define OBUF_SZ     16384
+%define TERMIOS_SZ  60
+
+; ioctl commands
+%define TCGETS      0x5401
+%define TCSETS      0x5402
+%define TIOCGWINSZ  0x5413
+
+; termios offsets
+%define LFLAG_OFF   12
+%define VTIME_OFF   22
+%define VMIN_OFF    23
+
+; termios flags
+%define ICANON      0x02
+%define ECHO        0x08
 
 section .data
     path_proc:   db "/proc",0
@@ -33,42 +48,62 @@ section .data
     a_yellow:    db 27,"[33m",0
     a_reset:     db 27,"[0m",0
     a_dim:       db 27,"[2m",0
+    a_rev:       db 27,"[7m",0
 
     s_title:     db "File Descriptor Monitor",10,0
-    s_sep:       db 27,"[K════════════════════════════════════════════════════",10,0
-    s_lsep:      db 27,"[K────────────────────────────────────────────────────",10,0
+    s_sep:       db 27,"[K════════════════════════════════════════════════════════════",10,0
+    s_lsep:      db 27,"[K────────────────────────────────────────────────────────────",10,0
     s_hdr:       db "    PID     FDs  Command",0
+    s_hdr_mem:   db "    PID     FDs      Mem  Command",0
     s_nl:        db 27,"[K",10,0
-    s_quit:      db 27,"[K",10,"Press Ctrl+C to quit",27,"[K",10,0
     s_none:      db "No readable processes found!",27,"[K",10,0
     s_tot_a:     db "  Total: ",0
     s_tot_b:     db " fds across ",0
     s_tot_c:     db " processes",0
     s_2sp:       db "  ",0
+    s_mb:        db "M",0
     s_sys:       db "  System Limits",27,"[K",10,0
     s_kern:      db "    Kernel handles    ",0
     s_of:        db " / ",0
     s_pproc:     db "    Per-process max   ",0
 
-    ts_1s:       dq 1, 0
+    ; Footer with key hints
+    s_keys:      db 27,"[K",10,"  ",0
+    s_k_fds:     db "[F]ds ",0
+    s_k_pid:     db "[P]id ",0
+    s_k_mem_on:  db "[M]em:on  ",0
+    s_k_mem_off: db "[M]em:off ",0
+    s_k_quit:    db "[Q]uit",0
+
     sigact:      dq on_sigint, 0x04000000, sa_restore, 0
 
 section .bss
-    obuf:   resb OBUF_SZ
-    optr:   resq 1
-    dbuf:   resb DBUF_SZ
-    pbuf:   resb 64
-    nbuf:   resb 32
-    procs:  resb PROC_SZ * MAX_PROCS
-    pcnt:   resq 1
-    winsz:  resb 8
-    maxdsp: resd 1
+    obuf:       resb OBUF_SZ
+    optr:       resq 1
+    dbuf:       resb DBUF_SZ
+    pbuf:       resb 64
+    nbuf:       resb 32
+    procs:      resb PROC_SZ * MAX_PROCS
+    pcnt:       resq 1
+    winsz:      resb 8
+    maxdsp:     resd 1
+    termios_o:  resb TERMIOS_SZ
+    termios_r:  resb TERMIOS_SZ
+    keybuf:     resb 1
+    sort_mode:  resb 1          ; 0=fds desc, 1=pid asc
+    show_mem:   resb 1          ; 0=off, 1=on
 
 section .text
     global _start
 
-; ── Signal handler ──────────────────────────────
 on_sigint:
+    ; Restore terminal settings
+    mov eax, 16
+    xor edi, edi
+    mov esi, TCSETS
+    mov rdx, termios_o
+    syscall
+    ; Show cursor, leave alt screen
     mov eax, 1
     mov edi, 1
     mov rsi, a_cleanup
@@ -82,14 +117,43 @@ sa_restore:
     mov eax, 15
     syscall
 
-; ── Entry point ─────────────────────────────────
 _start:
+    ; Install SIGINT handler
     mov eax, 13
     mov edi, 2
     mov rsi, sigact
     xor edx, edx
     mov r10d, 8
     syscall
+
+    ; Save original terminal settings
+    mov eax, 16
+    xor edi, edi
+    mov esi, TCGETS
+    mov rdx, termios_o
+    syscall
+
+    ; Copy to raw and modify
+    mov rsi, termios_o
+    mov rdi, termios_r
+    mov ecx, TERMIOS_SZ
+    rep movsb
+
+    ; Set raw mode: clear ICANON|ECHO, set VMIN=0, VTIME=10
+    and dword [termios_r + LFLAG_OFF], ~(ICANON | ECHO)
+    mov byte [termios_r + VMIN_OFF], 0
+    mov byte [termios_r + VTIME_OFF], 10
+
+    ; Apply raw mode
+    mov eax, 16
+    xor edi, edi
+    mov esi, TCSETS
+    mov rdx, termios_r
+    syscall
+
+    ; Initialize state
+    mov byte [sort_mode], 0
+    mov byte [show_mem], 0
 
     mov rax, obuf
     mov [optr], rax
@@ -109,11 +173,11 @@ _start:
     ; Query terminal height
     mov eax, 16
     mov edi, 1
-    mov esi, 0x5413
+    mov esi, TIOCGWINSZ
     lea rdx, [winsz]
     syscall
     movzx eax, word [winsz]
-    sub eax, 12
+    sub eax, 14
     jg .got_rows
     mov eax, 1
 .got_rows:
@@ -140,25 +204,82 @@ _start:
 
     call show_procs
     call show_sysinfo
+    call show_keys
 
-    mov rsi, a_dim
-    call emit
-    mov rsi, s_quit
-    call emit
-    mov rsi, a_reset
-    call emit
     mov rsi, a_clreos
     call emit
 
     call flush
 
-    mov eax, 35
-    mov rdi, ts_1s
-    xor esi, esi
+    ; Read keyboard with 1s timeout (VTIME=10)
+    xor eax, eax
+    xor edi, edi
+    mov rsi, keybuf
+    mov edx, 1
     syscall
+
+    test eax, eax
+    jle .loop
+
+    ; Handle keypress
+    movzx eax, byte [keybuf]
+
+    ; 'q' or 'Q' - quit
+    cmp al, 'q'
+    je .quit
+    cmp al, 'Q'
+    je .quit
+
+    ; 'f' or 'F' - sort by FDs
+    cmp al, 'f'
+    je .sort_fds
+    cmp al, 'F'
+    je .sort_fds
+
+    ; 'p' or 'P' - sort by PID
+    cmp al, 'p'
+    je .sort_pid
+    cmp al, 'P'
+    je .sort_pid
+
+    ; 'm' or 'M' - toggle memory column
+    cmp al, 'm'
+    je .toggle_mem
+    cmp al, 'M'
+    je .toggle_mem
+
     jmp .loop
 
-; ── Scan all processes ──────────────────────────
+.sort_fds:
+    mov byte [sort_mode], 0
+    jmp .loop
+
+.sort_pid:
+    mov byte [sort_mode], 1
+    jmp .loop
+
+.toggle_mem:
+    xor byte [show_mem], 1
+    jmp .loop
+
+.quit:
+    ; Restore terminal
+    mov eax, 16
+    xor edi, edi
+    mov esi, TCSETS
+    mov rdx, termios_o
+    syscall
+    ; Cleanup display
+    mov eax, 1
+    mov edi, 1
+    mov rsi, a_cleanup
+    mov edx, CLEANUP_LEN
+    syscall
+    ; Exit
+    mov eax, 60
+    xor edi, edi
+    syscall
+
 scan_procs:
     push r12
     push r13
@@ -199,7 +320,7 @@ scan_procs:
     jge .next
 
     mov rcx, [pcnt]
-    shl rcx, 5
+    imul rcx, rcx, PROC_SZ
     mov [procs + rcx + OFF_PID], rax
     inc qword [pcnt]
 
@@ -219,8 +340,7 @@ scan_procs:
     cmp r12, [pcnt]
     jge .done
 
-    mov rax, r12
-    shl rax, 5
+    imul rax, r12, PROC_SZ
     lea r14, [procs + rax]
 
     mov rdi, [r14 + OFF_PID]
@@ -235,7 +355,7 @@ scan_procs:
 .remove:
     dec qword [pcnt]
     mov rcx, [pcnt]
-    shl rcx, 5
+    imul rcx, rcx, PROC_SZ
     mov rax, [procs + rcx + OFF_PID]
     mov [r14 + OFF_PID], rax
     jmp .fill
@@ -246,9 +366,7 @@ scan_procs:
     pop r12
     ret
 
-; ── Probe one process: count fds + read name ────
-; rdi = pid, rsi = proc entry pointer
-; Returns rax = fd count or negative on error
+; Probe one process: count fds, read name, read memory
 probe_proc:
     push r12
     push r13
@@ -285,9 +403,9 @@ probe_proc:
     jmp .cpyd
 
 .pfx:
-    mov r14, rcx            ; save suffix position
+    mov r14, rcx
 
-    ; Append "/fd" and open
+    ; --- Count FDs ---
     mov dword [r14], '/fd'
     mov eax, 2
     mov rdi, pbuf
@@ -330,7 +448,7 @@ probe_proc:
     syscall
     mov [r13 + OFF_FDS], r15
 
-    ; Overwrite suffix with "/comm" and read name
+    ; --- Read /comm ---
     mov dword [r14], '/com'
     mov word [r14+4], 'm'
 
@@ -364,17 +482,90 @@ probe_proc:
     dec ecx
 .term:
     mov byte [r13 + rcx + OFF_NAME], 0
-
-    mov rax, [r13 + OFF_FDS]
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
+    jmp .read_mem
 
 .no_name:
     mov byte [r13 + OFF_NAME], '?'
     mov byte [r13 + OFF_NAME + 1], 0
+
+.read_mem:
+    ; --- Read /statm for RSS ---
+    mov qword [r13 + OFF_MEM], 0
+
+    mov dword [r14], '/sta'
+    mov word [r14+4], 'tm'
+    mov byte [r14+6], 0
+
+    mov eax, 2
+    mov rdi, pbuf
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test eax, eax
+    js .done_ok
+    mov r12d, eax
+
+    xor eax, eax
+    mov edi, r12d
+    mov rsi, pbuf
+    mov edx, 63
+    syscall
+    push rax
+
+    mov eax, 3
+    mov edi, r12d
+    syscall
+
+    pop rax
+    test eax, eax
+    jle .done_ok
+
+    ; Parse statm: skip first number, parse second (RSS in pages)
+    mov byte [pbuf + rax], 0
+    lea rdi, [pbuf]
+
+    ; Skip first number (size)
+.skip1:
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .skip1_done
+    cmp al, 9
+    je .skip1_done
+    test al, al
+    jz .done_ok
+    inc rdi
+    jmp .skip1
+.skip1_done:
+    ; Skip whitespace
+.skip_ws:
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .skip_ws_next
+    cmp al, 9
+    je .skip_ws_next
+    jmp .parse_rss
+.skip_ws_next:
+    inc rdi
+    jmp .skip_ws
+
+.parse_rss:
+    xor eax, eax
+.rss_loop:
+    movzx edx, byte [rdi]
+    sub dl, '0'
+    cmp dl, 9
+    ja .rss_done
+    lea rax, [rax + rax*4]
+    add rax, rax
+    add rax, rdx
+    inc rdi
+    jmp .rss_loop
+.rss_done:
+    ; RSS is in pages, convert to bytes (page = 4096)
+    shl rax, 12
+    mov [r13 + OFF_MEM], rax
+
+.done_ok:
     mov rax, [r13 + OFF_FDS]
     pop r15
     pop r14
@@ -390,9 +581,6 @@ probe_proc:
     pop r12
     ret
 
-; ── Parse PID string: validate + convert ────────
-; rdi = string pointer
-; Returns: rax = parsed PID (CF clear), or CF set on failure
 try_parse_pid:
     xor eax, eax
     cmp byte [rdi], 0
@@ -416,14 +604,17 @@ try_parse_pid:
     stc
     ret
 
-; ── Insertion sort by fd count descending ───────
 sort_procs:
     push r12
     push r13
     push r14
+    push r15
 
     cmp qword [pcnt], 1
     jle .done
+
+    ; r15 = sort_mode (0=fds desc, 1=pid asc)
+    movzx r15d, byte [sort_mode]
 
     mov r12, 1
 
@@ -432,15 +623,22 @@ sort_procs:
     jge .done
 
     ; Save procs[i] to stack
-    mov rax, r12
-    shl rax, 5
+    imul rax, r12, PROC_SZ
     lea rsi, [procs + rax]
-    sub rsp, 32
+    sub rsp, PROC_SZ
     mov rdi, rsp
-    mov ecx, 4
+    mov ecx, 5
     rep movsq
 
+    ; Key value for comparison
+    test r15d, r15d
+    jnz .key_pid
     mov r13, [rsp + OFF_FDS]
+    jmp .key_done
+.key_pid:
+    mov r13, [rsp + OFF_PID]
+.key_done:
+
     mov r14, r12
     dec r14
 
@@ -448,15 +646,26 @@ sort_procs:
     cmp r14, 0
     jl .insert
 
-    mov rax, r14
-    shl rax, 5
+    imul rax, r14, PROC_SZ
+
+    ; Compare based on sort mode
+    test r15d, r15d
+    jnz .cmp_pid
+
+    ; Sort by FDs descending
     cmp [procs + rax + OFF_FDS], r13
     jge .insert
+    jmp .shift
 
-    ; Shift procs[j] -> procs[j+1]
+.cmp_pid:
+    ; Sort by PID ascending
+    cmp [procs + rax + OFF_PID], r13
+    jle .insert
+
+.shift:
     lea rsi, [procs + rax]
     lea rdi, [procs + rax + PROC_SZ]
-    mov ecx, 4
+    mov ecx, 5
     rep movsq
 
     dec r14
@@ -464,35 +673,45 @@ sort_procs:
 
 .insert:
     lea rax, [r14 + 1]
-    shl rax, 5
+    imul rax, rax, PROC_SZ
     lea rdi, [procs + rax]
     mov rsi, rsp
-    mov ecx, 4
+    mov ecx, 5
     rep movsq
-    add rsp, 32
+    add rsp, PROC_SZ
 
     inc r12
     jmp .outer
 
 .done:
+    pop r15
     pop r14
     pop r13
     pop r12
     ret
 
-; ── Display process table ───────────────────────
 show_procs:
     push r12
     push r13
     push r14
+    push r15
     push rbx
+
+    movzx r15d, byte [show_mem]
 
     cmp qword [pcnt], 0
     je .none
 
+    ; Header
     mov rsi, a_bold
     call emit
+    test r15d, r15d
+    jz .hdr_no_mem
+    mov rsi, s_hdr_mem
+    jmp .hdr_emit
+.hdr_no_mem:
     mov rsi, s_hdr
+.hdr_emit:
     call emit
     mov rsi, a_reset
     call emit
@@ -514,23 +733,40 @@ show_procs:
     cmp r13, r12
     jge .rest
 
-    mov rax, r13
-    shl rax, 5
+    imul rax, r13, PROC_SZ
     lea r14, [procs + rax]
     add rbx, [r14 + OFF_FDS]
 
+    ; PID (yellow)
     mov rsi, a_yellow
     call emit
     mov rdi, [r14 + OFF_PID]
     mov esi, 7
     call emit_rpad
 
+    ; FDs (cyan)
     mov rsi, a_cyan
     call emit
     mov rdi, [r14 + OFF_FDS]
     mov esi, 7
     call emit_rpad
 
+    ; Memory column (if enabled)
+    test r15d, r15d
+    jz .no_mem_col
+
+    mov rsi, a_cyan
+    call emit
+    mov rax, [r14 + OFF_MEM]
+    shr rax, 20             ; bytes to MB
+    mov rdi, rax
+    mov esi, 7
+    call emit_rpad
+    mov rsi, s_mb
+    call emit
+
+.no_mem_col:
+    ; Command name (dim)
     mov rsi, a_reset
     call emit
     mov rsi, a_dim
@@ -550,8 +786,7 @@ show_procs:
 .rest:
     cmp r13, [pcnt]
     jge .totals
-    mov rax, r13
-    shl rax, 5
+    imul rax, r13, PROC_SZ
     add rbx, [procs + rax + OFF_FDS]
     inc r13
     jmp .rest
@@ -583,12 +818,12 @@ show_procs:
 
 .end:
     pop rbx
+    pop r15
     pop r14
     pop r13
     pop r12
     ret
 
-; ── Display system fd limits ────────────────────
 show_sysinfo:
     push r12
     push r13
@@ -657,8 +892,63 @@ show_sysinfo:
     pop r12
     ret
 
-; ── Read first integer from a /proc file ────────
-; rdi = path, returns rax = value or -1
+show_keys:
+    mov rsi, s_keys
+    call emit
+    mov rsi, a_dim
+    call emit
+
+    ; Show sort mode - highlight active
+    cmp byte [sort_mode], 0
+    jne .pid_sort
+    mov rsi, a_rev
+    call emit
+    mov rsi, s_k_fds
+    call emit
+    mov rsi, a_reset
+    call emit
+    mov rsi, a_dim
+    call emit
+    mov rsi, s_k_pid
+    call emit
+    jmp .show_mem_key
+.pid_sort:
+    mov rsi, s_k_fds
+    call emit
+    mov rsi, a_rev
+    call emit
+    mov rsi, s_k_pid
+    call emit
+    mov rsi, a_reset
+    call emit
+    mov rsi, a_dim
+    call emit
+
+.show_mem_key:
+    cmp byte [show_mem], 0
+    jne .mem_on
+    mov rsi, s_k_mem_off
+    call emit
+    jmp .show_quit
+.mem_on:
+    mov rsi, a_rev
+    call emit
+    mov rsi, s_k_mem_on
+    call emit
+    mov rsi, a_reset
+    call emit
+    mov rsi, a_dim
+    call emit
+
+.show_quit:
+    mov rsi, s_k_quit
+    call emit
+    mov rsi, a_reset
+    call emit
+    mov rsi, s_nl
+    call emit
+    ret
+
 read_proc_int:
     push r12
 
@@ -706,9 +996,6 @@ read_proc_int:
     pop r12
     ret
 
-; ── Output buffering ────────────────────────────
-
-; emit: append null-terminated string at rsi to obuf
 emit:
     mov rdi, [optr]
 .lp:
@@ -721,7 +1008,6 @@ emit:
     mov [optr], rdi
     ret
 
-; emit_n: append edx bytes from rsi to obuf
 emit_n:
     mov rdi, [optr]
     mov ecx, edx
@@ -729,8 +1015,6 @@ emit_n:
     mov [optr], rdi
     ret
 
-; fmt_num: format unsigned rdi into nbuf
-; Returns rsi = pointer to start of digits (null-terminated)
 fmt_num:
     mov rax, rdi
     lea r8, [nbuf + 30]
@@ -755,16 +1039,13 @@ fmt_num:
     mov rsi, r8
     ret
 
-; emit_num: format rdi and emit
 emit_num:
     call fmt_num
     jmp emit
 
-; emit_rpad: emit rdi right-aligned in esi-char field
 emit_rpad:
     mov r9d, esi
     call fmt_num
-    ; rsi = digit string, count its length
     mov rdi, rsi
     xor ecx, ecx
 .cnt:
@@ -786,7 +1067,6 @@ emit_rpad:
 .out:
     jmp emit
 
-; flush: write obuf to stdout, reset pointer
 flush:
     mov rsi, obuf
     mov rdx, [optr]
